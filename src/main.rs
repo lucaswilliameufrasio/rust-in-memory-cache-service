@@ -237,6 +237,8 @@ async fn main() {
     // Initialize tracing subscriber (logging)
     tracing_subscriber::fmt::init();
 
+    let port = std::env::var("PORT").unwrap_or("8080".to_string());
+
     // Create Moka cache with custom expiration policy.
     let cache: Cache<String, CacheValue> = Cache::builder()
         .weigher(|_k, (_ttl, _v)| 1)
@@ -258,7 +260,7 @@ async fn main() {
         .with_state(app_state);
 
     // Run server on localhost:8080.
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
     tracing::info!("Starting server on {}", addr);
