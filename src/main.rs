@@ -255,6 +255,14 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
 
+    // Create a `Cache<u32, (Expiration, String)>` with an expiry `MyExpiry` and
+    // eviction listener.
+    let expiry = ExpiryPolicyForCacheExt;
+
+    let eviction_listener = |key, _value, cause| {
+        tracing::debug!("Evicted key {key}. Cause: {cause:?}");
+    };
+
     // Create Moka cache with custom expiration policy.
     let cache: Cache<String, CacheValue> = Cache::builder()
         .weigher(
@@ -263,7 +271,9 @@ async fn main() {
             },
         )
         .max_capacity(10_000)
-        .time_to_live(Duration::from_secs(3600)) // default TTL if not provided; our custom expiry takes precedence.
+        .expire_after(expiry)
+        .eviction_listener(eviction_listener)
+        // .time_to_live(Duration::from_secs(3600)) // default TTL if not provided; our custom expiry takes precedence.
         .build();
 
     let app_state = AppState {
