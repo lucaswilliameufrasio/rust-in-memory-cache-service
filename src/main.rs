@@ -189,6 +189,20 @@ async fn delete_cache(
     ))
 }
 
+async fn invalidate_by_text(
+    State(state): State<AppState>,
+    Path(text): Path<String>,
+) -> Result<impl IntoResponse, Infallible> {
+    let _ = state.cache.invalidate_entries_if(move |key, _cache| {
+        key.contains(&text)
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "message": format!("Cache keys invalidated") })),
+    ))
+}
+
 async fn fallback(uri: Uri) -> impl IntoResponse {
     tracing::error!("No route for {}", uri);
     (
@@ -207,11 +221,14 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    
 
     // Create Moka cache with custom expiration policy.
     let cache: Cache<String, CacheValue> = Cache::builder()
-        .weigher(|_k, (_ttl, _v)| 1)
-        .max_capacity(100)
+        .weigher(|_k: &String, (_ttl, value): &(Option<Duration>, Vec<u8>)| -> u32 {
+            value.len().try_into().unwrap_or(u32::MAX)
+        })
+        .max_capacity(10_000)
         .time_to_live(Duration::from_secs(3600)) // default TTL if not provided; our custom expiry takes precedence.
         .build();
 
@@ -225,6 +242,7 @@ async fn main() {
         .route("/cache/{key}", get(find_cache_by_key))
         .route("/cache/{key}", post(save_cache))
         .route("/cache/{key}", delete(delete_cache))
+        .route("/cache/{text}", delete(invalidate_by_text))
         .fallback(fallback)
         .with_state(app_state);
 
