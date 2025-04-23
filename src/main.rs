@@ -291,7 +291,7 @@ async fn main() {
         .fallback(fallback)
         .with_state(app_state);
 
-    // Run server on localhost:8080.
+    // Run server on localhost:<port>.
     let address = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
 
