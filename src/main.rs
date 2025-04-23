@@ -1,4 +1,4 @@
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -8,6 +8,7 @@ use axum::{
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use moka::future::Cache;
+use rmp_serde::{decode, encode};
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -19,7 +20,6 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tracing_subscriber;
-use rmp_serde::{decode, encode};
 
 // ------------------ Moka TTL Expiry Section ------------------
 
@@ -84,10 +84,7 @@ impl<T: Send + 'static> SingleFlight<T> {
             return shared_future.clone().await;
         } else {
             // Map errors to Arc<anyhow::Error> for cloning
-            let future = f()
-                .map(|res| res.map_err(Arc::new))
-                .boxed()
-                .shared();
+            let future = f().map(|res| res.map_err(Arc::new)).boxed().shared();
             guard.insert(key.clone(), future.clone());
             drop(guard);
             let result = future.await;
@@ -127,32 +124,9 @@ async fn get_cache_handler(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    // If not present in cache, use singleflight to deduplicate concurrent fetches.
-    // let ttl_duration = Duration::from_secs(5);
     let key_clone = key.clone();
-    // let fetch_future = || async move {
-    //     // Simulate a slow backend call.
-    //     tokio::time::sleep(Duration::from_secs(2)).await;
-    //     Ok(format!(
-    //         "Fetched value for key {} at {}",
-    //         key_clone,
-    //         chrono::Utc::now().to_rfc2822()
-    //     ))
-    // }
-    // .boxed();
 
-    // match state.singleflight.do_call(key.clone(), fetch_future).await {
-    //     Ok(fetched_value) => {
-    //         // Insert fetched value into cache using our TTL extension.
-    //         state
-    //             .cache
-    //             .insert_with_ttl(key.clone(), fetched_value.clone(), Some(ttl_duration))
-    //             .await;
-    //         Ok((StatusCode::OK, format!("Key: {}\nValue: {}\n", key, fetched_value)))
-    //     }
-    //     Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    // }
-
+    // If not present in cache, use singleflight to deduplicate concurrent fetches.
     match state
         .singleflight
         .do_call(key.clone(), || {
@@ -170,17 +144,13 @@ async fn get_cache_handler(
         .await
     {
         Ok(cached_value) => {
-            // tracing::debug!("Oxi cached_value {:?}", cached_value);
-
             let deserialized = decode::from_slice::<serde_json::Value>(&cached_value).unwrap();
 
-            // tracing::debug!("Oxi deserialized {:?}", deserialized);
-
-            
             Ok((
-            StatusCode::OK,
-            Json(json!({ "key": key_clone, "value": deserialized})),
-        ))},
+                StatusCode::OK,
+                Json(json!({ "key": key_clone, "value": deserialized})),
+            ))
+        }
         Err(_) => Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Key not found", "error_code": "KEY_NOT_FOUND" })),
@@ -195,7 +165,6 @@ async fn post_cache_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let ttl = payload.ttl.map(Duration::from_millis);
     let serialized = encode::to_vec(&payload.value).unwrap();
-    // tracing::debug!("Oxi {:?} {}", serialized, payload.value);
 
     state
         .cache
