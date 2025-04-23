@@ -292,10 +292,10 @@ async fn main() {
         .with_state(app_state);
 
     // Run server on localhost:8080.
-    let addr = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let address = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
 
-    tracing::info!("Starting server on {}", addr);
+    tracing::info!("Starting server on {}", address);
 
     axum::serve(listener, app).await.unwrap();
 }
