@@ -235,7 +235,7 @@ async fn save_cache(
     Path(key): Path<String>,
     Json(payload): Json<SetPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let ttl = payload.ttl.map(Duration::from_secs);
+    let ttl = payload.ttl.map(Duration::from_millis);
     let serialized = encode::to_vec(&payload.value).unwrap();
 
     state
