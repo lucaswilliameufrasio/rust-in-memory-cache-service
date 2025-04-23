@@ -28,15 +28,47 @@ pub type CacheValue = (Option<Duration>, Vec<u8>);
 pub struct ExpiryPolicyForCacheExt;
 
 impl moka::Expiry<String, CacheValue> for ExpiryPolicyForCacheExt {
+    fn expire_after_read(
+        &self,
+        _key: &String,
+        _value: &CacheValue,
+        _read_at: Instant,
+        duration_until_expiry: Option<Duration>,
+        _last_modified_at: Instant,
+    ) -> Option<Duration> {
+        tracing::debug!("Key to expire on read {} {:?}", _key, duration_until_expiry);
+        duration_until_expiry
+    }
+
     fn expire_after_create(
         &self,
         _key: &String,
         value: &CacheValue,
         _current_time: Instant,
     ) -> Option<Duration> {
+        tracing::debug!("Key to expire on create {} {:?}", _key, value.0);
+
         // Return the TTL provided in the cache value.
         value.0
     }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        _value: &CacheValue,
+        _updated_at: Instant,
+        duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        tracing::debug!(
+            "Key to expire on update {} {:?}",
+            _key,
+            duration_until_expiry
+        );
+
+        duration_until_expiry
+    }
+
+    
 }
 
 pub trait CacheExt<K, V> {
@@ -51,6 +83,9 @@ impl CacheExt<String, Vec<u8>> for Cache<String, CacheValue> {
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, ()> {
         async move {
+            if self.contains_key(&key) == true {
+                self.invalidate(&key).await;
+            };
             self.insert(key, (ttl, value)).await;
         }
         .boxed()
@@ -181,13 +216,17 @@ async fn find_cache_by_key(
 
             Ok((
                 StatusCode::OK,
-                Json(json!({ "key": key_clone, "value": deserialized})),
+                Json(json!({ "key": key_clone, "value": deserialized })),
             ))
         }
-        Err(_) => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "message": "Key not found", "error_code": "KEY_NOT_FOUND" })),
-        )),
+        Err(error) => {
+            tracing::debug!("Failed to find cache by key {:?}", error);
+
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "Key not found", "error_code": "KEY_NOT_FOUND" })),
+            ))
+        }
     }
 }
 
@@ -196,7 +235,7 @@ async fn save_cache(
     Path(key): Path<String>,
     Json(payload): Json<SetPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let ttl = payload.ttl.map(Duration::from_millis);
+    let ttl = payload.ttl.map(Duration::from_secs);
     let serialized = encode::to_vec(&payload.value).unwrap();
 
     state
