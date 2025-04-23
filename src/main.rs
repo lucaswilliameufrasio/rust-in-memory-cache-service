@@ -83,9 +83,7 @@ impl CacheExt<String, Vec<u8>> for Cache<String, CacheValue> {
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, ()> {
         async move {
-            if self.contains_key(&key) == true {
-                self.invalidate(&key).await;
-            };
+            self.invalidate(&key).await;
             self.insert(key, (ttl, value)).await;
         }
         .boxed()
