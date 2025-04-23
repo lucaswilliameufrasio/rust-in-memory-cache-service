@@ -1,7 +1,7 @@
 use anyhow::{Error, bail};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, Uri},
     response::IntoResponse,
     routing::{delete, get, post},
@@ -9,7 +9,7 @@ use axum::{
 use futures::future::{BoxFuture, FutureExt, Shared};
 use moka::future::Cache;
 use rmp_serde::{decode, encode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
 use std::{
@@ -120,6 +120,39 @@ struct SetPayload {
 
 // ------------------ Handlers ------------------
 
+#[derive(Deserialize)]
+struct LoadCacheEntriesQueryParams {
+    prefix: String,
+}
+
+#[derive(Serialize)]
+struct LoadCacheEntriesResult {
+    key: String,
+    ttl: Option<Duration>,
+}
+
+async fn load_cache_entries(
+    State(state): State<AppState>,
+    Query(query_params): Query<LoadCacheEntriesQueryParams>,
+) -> Result<impl IntoResponse, Infallible> {
+    let entries: Vec<LoadCacheEntriesResult> = state
+        .cache
+        .iter()
+        .filter(|(key, (_ttl, _value))| key.starts_with(&query_params.prefix))
+        .map(|(key, (ttl, _value))| LoadCacheEntriesResult {
+            key: key.to_string(),
+            ttl,
+        })
+        .collect();
+
+    let number_of_entries = entries.len();
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "count": number_of_entries, "entries": entries })),
+    ))
+}
+
 async fn find_cache_by_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -193,9 +226,9 @@ async fn invalidate_by_text(
     State(state): State<AppState>,
     Path(text): Path<String>,
 ) -> Result<impl IntoResponse, Infallible> {
-    let _ = state.cache.invalidate_entries_if(move |key, _cache| {
-        key.contains(&text)
-    });
+    let _ = state
+        .cache
+        .invalidate_entries_if(move |key, _cache| key.contains(&text));
 
     Ok((
         StatusCode::OK,
@@ -221,13 +254,14 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
-    
 
     // Create Moka cache with custom expiration policy.
     let cache: Cache<String, CacheValue> = Cache::builder()
-        .weigher(|_k: &String, (_ttl, value): &(Option<Duration>, Vec<u8>)| -> u32 {
-            value.len().try_into().unwrap_or(u32::MAX)
-        })
+        .weigher(
+            |_k: &String, (_ttl, value): &(Option<Duration>, Vec<u8>)| -> u32 {
+                value.len().try_into().unwrap_or(u32::MAX)
+            },
+        )
         .max_capacity(10_000)
         .time_to_live(Duration::from_secs(3600)) // default TTL if not provided; our custom expiry takes precedence.
         .build();
@@ -239,10 +273,11 @@ async fn main() {
 
     // Build the Axum router.
     let app = Router::new()
+        .route("/cache", get(load_cache_entries))
         .route("/cache/{key}", get(find_cache_by_key))
         .route("/cache/{key}", post(save_cache))
         .route("/cache/{key}", delete(delete_cache))
-        .route("/cache/{text}", delete(invalidate_by_text))
+        .route("/cache/patterns/{text}", delete(invalidate_by_text))
         .fallback(fallback)
         .with_state(app_state);
 
