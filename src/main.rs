@@ -120,7 +120,7 @@ struct SetPayload {
 
 // ------------------ Handlers ------------------
 
-async fn get_cache_handler(
+async fn find_cache_by_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -158,7 +158,7 @@ async fn get_cache_handler(
     }
 }
 
-async fn post_cache_handler(
+async fn save_cache(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Json(payload): Json<SetPayload>,
@@ -178,7 +178,7 @@ async fn post_cache_handler(
     Ok((StatusCode::OK, Json(json!({ "message": msg }))))
 }
 
-async fn delete_cache_handler(
+async fn delete_cache(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, Infallible> {
@@ -222,9 +222,9 @@ async fn main() {
 
     // Build the Axum router.
     let app = Router::new()
-        .route("/cache/{key}", get(get_cache_handler))
-        .route("/cache/{key}", post(post_cache_handler))
-        .route("/cache/{key}", delete(delete_cache_handler))
+        .route("/cache/{key}", get(find_cache_by_key))
+        .route("/cache/{key}", post(save_cache))
+        .route("/cache/{key}", delete(delete_cache))
         .fallback(fallback)
         .with_state(app_state);
 
