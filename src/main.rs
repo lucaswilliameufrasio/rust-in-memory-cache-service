@@ -236,6 +236,10 @@ async fn invalidate_by_text(
     ))
 }
 
+async fn health_check() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "message": "ok" })))
+}
+
 async fn fallback(uri: Uri) -> impl IntoResponse {
     tracing::error!("No route for {}", uri);
     (
@@ -288,6 +292,7 @@ async fn main() {
         .route("/cache/{key}", post(save_cache))
         .route("/cache/{key}", delete(delete_cache))
         .route("/cache/patterns/{text}", delete(invalidate_by_text))
+        .route("/health-check", get(health_check))
         .fallback(fallback)
         .with_state(app_state);
 
