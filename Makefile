@@ -21,5 +21,5 @@ update-dependencies-on-lockfile:
 .PHONY: update-dependencies-on-lockfile
 
 upgrade-dependencies:
-	cargo upgrade && cargo upgrade
+	cargo upgrade
 .PHONY: upgrade-dependencies

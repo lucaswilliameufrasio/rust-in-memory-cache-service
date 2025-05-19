@@ -6,24 +6,27 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post},
 };
+use chrono::{DateTime, Utc};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use moka::future::Cache;
 use rmp_serde::{decode, encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::convert::Infallible;
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
+use std::{
+    convert::Infallible,
+    net::{IpAddr, Ipv6Addr},
+};
 use tokio::sync::Mutex;
-use tracing_subscriber;
 
 // ------------------ Moka TTL Expiry Section ------------------
 
-pub type CacheValue = (Option<Duration>, Vec<u8>);
+pub type CacheValue = (Option<DateTime<Utc>>, Vec<u8>);
 
 pub struct ExpiryPolicyForCacheExt;
 
@@ -49,7 +52,17 @@ impl moka::Expiry<String, CacheValue> for ExpiryPolicyForCacheExt {
         tracing::debug!("Key to expire on create {} {:?}", _key, value.0);
 
         // Return the TTL provided in the cache value.
-        value.0
+        value.0.and_then(|expires_at| {
+            let now = Utc::now();
+            let chrono_duration = expires_at - now;
+            if chrono_duration > chrono::Duration::zero() {
+                // Try to convert to std::time::Duration, which only works for positive durations.
+                chrono_duration.to_std().ok()
+            } else {
+                // Already expired
+                None
+            }
+        })
     }
 
     fn expire_after_update(
@@ -67,21 +80,23 @@ impl moka::Expiry<String, CacheValue> for ExpiryPolicyForCacheExt {
 
         duration_until_expiry
     }
+}
 
-    
+fn calculate_deadline(ttl: Option<Duration>) -> Option<DateTime<Utc>> {
+    ttl.map(|ttl| Utc::now() + chrono::Duration::from_std(ttl).unwrap())
 }
 
 pub trait CacheExt<K, V> {
-    fn insert_with_ttl<'a>(&'a self, key: K, value: V, ttl: Option<Duration>) -> BoxFuture<'a, ()>;
+    fn insert_with_ttl(&self, key: K, value: V, ttl: Option<DateTime<Utc>>) -> BoxFuture<'_, ()>;
 }
 
 impl CacheExt<String, Vec<u8>> for Cache<String, CacheValue> {
-    fn insert_with_ttl<'a>(
-        &'a self,
+    fn insert_with_ttl(
+        &self,
         key: String,
         value: Vec<u8>,
-        ttl: Option<Duration>,
-    ) -> BoxFuture<'a, ()> {
+        ttl: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'_, ()> {
         async move {
             self.invalidate(&key).await;
             self.insert(key, (ttl, value)).await;
@@ -161,7 +176,7 @@ struct LoadCacheEntriesQueryParams {
 #[derive(Serialize)]
 struct LoadCacheEntriesResult {
     key: String,
-    ttl: Option<Duration>,
+    ttl: Option<DateTime<Utc>>,
 }
 
 async fn load_cache_entries(
@@ -238,7 +253,7 @@ async fn save_cache(
 
     state
         .cache
-        .insert_with_ttl(key.clone(), serialized, ttl)
+        .insert_with_ttl(key.clone(), serialized, calculate_deadline(ttl))
         .await;
     let msg = if let Some(ttl_val) = ttl {
         format!("Key {} set successfully with TTL {:?}", key, ttl_val)
@@ -287,6 +302,40 @@ async fn fallback(uri: Uri) -> impl IntoResponse {
     )
 }
 
+async fn load_cache_snapshot(
+    snapshot_path: String,
+    cache: &Cache<String, CacheValue>,
+) -> Result<(), Error> {
+    use tokio::fs;
+
+    if let Ok(data) = fs::read(snapshot_path).await {
+        let entries: Vec<(String, CacheValue)> = decode::from_slice(&data)?;
+        for (key, (ttl, value)) in entries {
+            cache.insert(key, (ttl, value)).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn save_cache_snapshot(
+    snapshot_path: String,
+    cache: &Cache<String, CacheValue>,
+) -> Result<(), Error> {
+    use tokio::fs::File;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = File::create(snapshot_path).await?;
+    let entries: Vec<(String, CacheValue)> = cache
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+
+    let encoded = encode::to_vec(&entries)?;
+    file.write_all(&encoded).await?;
+    Ok(())
+}
+
 // ------------------ Main ------------------
 
 #[tokio::main]
@@ -295,6 +344,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    let snapshot_path =
+        std::env::var("SNAPSHOT_LOCATION").unwrap_or("cache-snapshot.rmp".to_string());
 
     // Create a `Cache<u32, (Expiration, String)>` with an expiry `MyExpiry` and
     // eviction listener.
@@ -307,18 +358,23 @@ async fn main() {
     // Create Moka cache with custom expiration policy.
     let cache: Cache<String, CacheValue> = Cache::builder()
         .weigher(
-            |_k: &String, (_ttl, value): &(Option<Duration>, Vec<u8>)| -> u32 {
+            |_k: &String, (_ttl, value): &(Option<DateTime<Utc>>, Vec<u8>)| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             },
         )
-        .max_capacity(10_000)
+        .max_capacity(1_000_000)
         .expire_after(expiry)
         .eviction_listener(eviction_listener)
         // .time_to_live(Duration::from_secs(3600)) // default TTL if not provided; our custom expiry takes precedence.
         .build();
 
+    // Load from disk before accepting requests.
+    if let Err(e) = load_cache_snapshot(snapshot_path.clone(), &cache).await {
+        tracing::warn!("Failed to load cache snapshot: {:?}", e);
+    }
+
     let app_state = AppState {
-        cache,
+        cache: cache.clone(),
         singleflight: SingleFlight::new(),
     };
 
@@ -334,10 +390,53 @@ async fn main() {
         .with_state(app_state);
 
     // Run server on localhost:<port>.
-    let address = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
+    let address = SocketAddr::from((IpAddr::from(Ipv6Addr::UNSPECIFIED), port.parse().unwrap()));
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
 
     tracing::info!("Starting server on {}", address);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(ShutdownInput {
+            snapshot_path,
+            cache,
+        }))
+        .await
+        .unwrap();
+}
+
+struct ShutdownInput {
+    snapshot_path: String,
+    cache: Cache<String, CacheValue>,
+}
+
+async fn shutdown_signal(input: ShutdownInput) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Closing all remaining connections after CTRL+C");
+            let _ = save_cache_snapshot(input.snapshot_path, &input.cache).await;
+        },
+        _ = terminate => {
+            tracing::info!("Closing all remaining connections after SIGTERM");
+            let _ = save_cache_snapshot(input.snapshot_path, &input.cache).await;
+        },
+    }
+
+    tracing::info!("signal received, starting graceful shutdown");
 }
