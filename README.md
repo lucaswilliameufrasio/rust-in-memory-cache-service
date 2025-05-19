@@ -170,13 +170,12 @@ You can run tests that exercise the HTTP API using `cargo test`:
 ```rust
 #[tokio::test]
 async fn test_set_and_get_cache_value() {
-    // Build the app
     let app = app_for_test();
 
     // Set value
     let key = "test-key";
     let payload = json!({"value": {"foo": "bar"}, "ttl": 10000});
-    let res = app
+    let response = app
         .clone()
         .oneshot(
             Request::builder()
@@ -188,10 +187,10 @@ async fn test_set_and_get_cache_value() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
 
     // Get value
-    let res = app
+    let response = app
         .oneshot(
             Request::builder()
                 .uri(format!("/cache/{key}"))
@@ -200,14 +199,14 @@ async fn test_set_and_get_cache_value() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
 
-    let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
-    let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(val["key"], key);
-    assert_eq!(val["value"]["foo"], "bar");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["key"], key);
+    assert_eq!(value["value"]["foo"], "bar");
 }
-
+```
 
 ---
 
