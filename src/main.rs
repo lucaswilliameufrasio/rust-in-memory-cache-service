@@ -107,10 +107,13 @@ impl CacheExt<String, Vec<u8>> for Cache<String, CacheValue> {
 
 // ------------------ SingleFlight Implementation ------------------
 
+type SingleFlightValue<T> =
+    Arc<Mutex<HashMap<String, Shared<BoxFuture<'static, Result<T, Arc<Error>>>>>>>;
+
 #[derive(Clone)]
 struct SingleFlight<T> {
     // Each key maps to a shared future that resolves to a Result<T, Arc<anyhow::Error>>
-    inner: Arc<Mutex<HashMap<String, Shared<BoxFuture<'static, Result<T, Arc<Error>>>>>>>,
+    inner: SingleFlightValue<T>,
 }
 
 impl<T: Send + 'static> SingleFlight<T> {
@@ -331,6 +334,18 @@ async fn save_cache_snapshot(
 
 // ------------------ Main ------------------
 
+fn build_router(app_state: AppState) -> Router {
+    Router::new()
+        .route("/cache", get(load_cache_entries))
+        .route("/cache/{key}", get(find_cache_by_key))
+        .route("/cache/{key}", post(save_cache))
+        .route("/cache/{key}", delete(delete_cache))
+        .route("/cache/patterns/{text}", delete(invalidate_by_text))
+        .route("/health-check", get(health_check))
+        .fallback(fallback)
+        .with_state(app_state)
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing subscriber (logging)
@@ -372,15 +387,7 @@ async fn main() {
     };
 
     // Build the Axum router.
-    let app = Router::new()
-        .route("/cache", get(load_cache_entries))
-        .route("/cache/{key}", get(find_cache_by_key))
-        .route("/cache/{key}", post(save_cache))
-        .route("/cache/{key}", delete(delete_cache))
-        .route("/cache/patterns/{text}", delete(invalidate_by_text))
-        .route("/health-check", get(health_check))
-        .fallback(fallback)
-        .with_state(app_state);
+    let app = build_router(app_state);
 
     // Run server on localhost:<port>.
     let address = SocketAddr::from((IpAddr::from(Ipv6Addr::UNSPECIFIED), port.parse().unwrap()));
@@ -432,4 +439,206 @@ async fn shutdown_signal(input: ShutdownInput) {
     }
 
     tracing::info!("signal received, starting graceful shutdown");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use moka::future::Cache;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_snapshot_save_and_load() {
+        // Create a temporary file for the snapshot
+        let tmp = NamedTempFile::new().unwrap();
+        let snapshot_path = tmp.path().to_str().unwrap().to_string();
+
+        // Create a cache and insert some data
+        let cache: Cache<String, CacheValue> = Cache::builder().max_capacity(10).build();
+        let key = "mykey".to_string();
+        let value = vec![1, 2, 3, 4];
+        let expires_at = Some(Utc::now() + ChronoDuration::seconds(5));
+        cache.insert(key.clone(), (expires_at, value.clone())).await;
+
+        // Save the cache to the snapshot file
+        save_cache_snapshot(snapshot_path.clone(), &cache)
+            .await
+            .unwrap();
+
+        // Create a new cache and load from the snapshot
+        let loaded_cache: Cache<String, CacheValue> = Cache::builder().max_capacity(10).build();
+        load_cache_snapshot(snapshot_path, &loaded_cache)
+            .await
+            .unwrap();
+
+        // The value should be present in the loaded cache
+        let loaded = loaded_cache.get(&key).await;
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().1, value);
+    }
+}
+
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+    use axum::Router;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt; // for `collect`
+    use serde_json::json;
+    use tower::ServiceExt; // for `call`, `oneshot`, and `ready`
+
+    // Helper to build the app for tests (without snapshotting)
+    fn app_for_test() -> Router {
+        let cache: Cache<String, CacheValue> = Cache::builder().max_capacity(100).build();
+        let app_state = AppState {
+            cache,
+            singleflight: SingleFlight::new(),
+        };
+        build_router(app_state)
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let app = app_for_test();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health-check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_set_and_get_cache_value() {
+        let app = app_for_test();
+
+        // Set value
+        let key = "test-key";
+        let payload = json!({"value": {"foo": "bar"}, "ttl": 10000});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/cache/{key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Get value
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/cache/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["key"], key);
+        assert_eq!(val["value"]["foo"], "bar");
+    }
+
+    #[tokio::test]
+    async fn test_delete_cache_value() {
+        let app = app_for_test();
+        let key = "delete-key";
+        let payload = json!({"value": {"x": 1}, "ttl": 5000});
+
+        // Set value
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/cache/{key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Delete value
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/cache/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Get value should now return NOT_FOUND
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/cache/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_cache_entries_by_prefix() {
+        let app = app_for_test();
+
+        // Set some values with common prefix
+        let payload = json!({"value": {"n": 1}, "ttl": 10000});
+        for suffix in ["1", "2", "3"] {
+            let key = format!("pfx-{suffix}");
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/cache/{key}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // List entries by prefix
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/cache?prefix=pfx-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["count"], 3);
+    }
 }

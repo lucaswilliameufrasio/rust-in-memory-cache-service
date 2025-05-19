@@ -35,6 +35,16 @@ The server listens on port `8080` by default. Change this with the `PORT` enviro
 
 ---
 
+## 🧑‍💻 Development
+
+To ensure code quality and consistency, use the following commands before committing:
+
+```bash
+cargo fmt --all        # Format code according to Rust style
+cargo clippy -- -D warnings   # Lint code and fail on any warnings
+
+---
+
 ## 🛣️ API Endpoints
 
 ### Set Cache Value
@@ -151,6 +161,52 @@ async fn test_snapshot_save_and_load() {
     assert_eq!(loaded.unwrap().1, value);
 }
 ```
+
+### API Integration Tests
+
+You can run tests that exercise the HTTP API using `cargo test`:
+
+```rust
+#[tokio::test]
+async fn test_set_and_get_cache_value() {
+    // Build the app
+    let app = app_for_test();
+
+    // Set value
+    let key = "test-key";
+    let payload = json!({"value": {"foo": "bar"}, "ttl": 10000});
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/cache/{key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Get value
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/cache/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(val["key"], key);
+    assert_eq!(val["value"]["foo"], "bar");
+}
+
 
 ---
 
