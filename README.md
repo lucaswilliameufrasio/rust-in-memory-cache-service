@@ -42,6 +42,7 @@ To ensure code quality and consistency, use the following commands before commit
 ```bash
 cargo fmt --all        # Format code according to Rust style
 cargo clippy -- -D warnings   # Lint code and fail on any warnings
+```
 
 ---
 
