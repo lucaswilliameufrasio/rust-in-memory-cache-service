@@ -1,4 +1,4 @@
-use anyhow::{Error, bail};
+use anyhow::Error;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -107,43 +107,61 @@ impl CacheExt<String, Vec<u8>> for Cache<String, CacheValue> {
 
 // ------------------ SingleFlight Implementation ------------------
 
-type SingleFlightValue<T> =
-    Arc<Mutex<HashMap<String, Shared<BoxFuture<'static, Result<T, Arc<Error>>>>>>>;
+type SingleFlightValue<T, E> =
+    Arc<Mutex<HashMap<String, Shared<BoxFuture<'static, Result<T, E>>>>>>;
 
+// now SingleFlight has two type params: T for success, E for error
 #[derive(Clone)]
-struct SingleFlight<T> {
-    // Each key maps to a shared future that resolves to a Result<T, Arc<anyhow::Error>>
-    inner: SingleFlightValue<T>,
+struct SingleFlight<T, E> {
+    inner: SingleFlightValue<T, E>,
 }
 
-impl<T: Send + 'static> SingleFlight<T> {
-    fn new() -> Self {
-        Self {
+impl<T, E> SingleFlight<T, E>
+where
+    T: Send + Sync + 'static + Clone,
+    E: Send + Sync + 'static + Clone,
+{
+    pub fn new() -> Self {
+        SingleFlight {
             inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn do_call<F>(&self, key: String, f: F) -> Result<T, Arc<Error>>
+    /// `f` must produce a `BoxFuture<'static, Result<T, E>>`
+    pub async fn do_call<F>(&self, key: String, f: F) -> Result<T, E>
     where
-        // The closure returns a future resulting in T on success.
-        F: FnOnce() -> BoxFuture<'static, Result<T, Error>>,
-        T: Clone, // Required for Shared to clone the success value.
+        F: FnOnce() -> BoxFuture<'static, Result<T, E>>,
     {
+        // lock and check if we already have an in‐flight future
         let mut guard = self.inner.lock().await;
-        if let Some(shared_future) = guard.get(&key) {
-            // A call is already in-flight; await its shared result
-            return shared_future.clone().await;
-        } else {
-            // Map errors to Arc<anyhow::Error> for cloning
-            let future = f().map(|res| res.map_err(Arc::new)).boxed().shared();
-            guard.insert(key.clone(), future.clone());
-            drop(guard);
-            let result = future.await;
-            let mut guard = self.inner.lock().await;
-            guard.remove(&key);
-            result
+        if let Some(shared_fut) = guard.get(&key) {
+            return shared_fut.clone().await;
         }
+
+        // first caller: create, share, and insert the future
+        let shared = f().boxed().shared();
+        guard.insert(key.clone(), shared.clone());
+        drop(guard);
+
+        // await the result (will be cloned for everyone who awaits)
+        let result = shared.await;
+
+        // remove it so next time we fetch again
+        let mut guard = self.inner.lock().await;
+        guard.remove(&key);
+
+        result
     }
+}
+
+// ------------------ Custom Errors ------------------
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ApplicationError {
+    #[error("Key not found: {0}")]
+    KeyNotFound(String),
+    #[error("Unknown error")]
+    Unknown,
 }
 
 // ------------------ Application State ------------------
@@ -151,7 +169,7 @@ impl<T: Send + 'static> SingleFlight<T> {
 #[derive(Clone)]
 struct AppState {
     cache: Cache<String, CacheValue>,
-    singleflight: SingleFlight<Vec<u8>>,
+    singleflight: SingleFlight<Vec<u8>, ApplicationError>,
 }
 
 // ------------------ Request Payloads ------------------
@@ -213,7 +231,7 @@ async fn find_cache_by_key(
                     // Since moka handles expiration via the custom expiry policy,
                     // if the item is present then it is valid.
                     Some((_, cached_value)) => Ok(cached_value),
-                    None => bail!("Key was not found"),
+                    None => Err(ApplicationError::KeyNotFound(key)),
                 }
             }
             .boxed()
@@ -231,10 +249,18 @@ async fn find_cache_by_key(
         Err(error) => {
             tracing::debug!("Failed to find cache by key {:?}", error);
 
-            Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "message": "Key not found", "error_code": "KEY_NOT_FOUND" })),
-            ))
+            match error {
+                ApplicationError::KeyNotFound(_) => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "message": "Key not found", "error_code": "KEY_NOT_FOUND" })),
+                )),
+                _ => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        json!({ "message": "Unknown error occurred", "error_code": "UNKNOWN_ERROR" }),
+                    ),
+                )),
+            }
         }
     }
 }
