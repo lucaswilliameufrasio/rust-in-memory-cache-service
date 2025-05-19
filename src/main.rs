@@ -159,13 +159,6 @@ struct SetPayload {
     ttl: Option<u64>, // TTL in seconds, optional.
 }
 
-// #[derive(Debug, Serialize)]
-// struct ApiResponse {
-//     key: String,
-//     value: String,
-//     message: String,
-// }
-
 // ------------------ Handlers ------------------
 
 #[derive(Deserialize)]
