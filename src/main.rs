@@ -360,6 +360,10 @@ async fn save_cache_snapshot(
 
 // ------------------ Main ------------------
 
+pub fn mb_to_bytes(mb: u64) -> u64 {
+    mb * 1024 * 1024
+}
+
 fn build_router(app_state: AppState) -> Router {
     Router::new()
         .route("/cache", get(load_cache_entries))
@@ -396,10 +400,9 @@ async fn main() {
                 value.len().try_into().unwrap_or(u32::MAX)
             },
         )
-        .max_capacity(1_000_000)
+        .max_capacity(mb_to_bytes(2_048))
         .expire_after(expiry)
         .eviction_listener(eviction_listener)
-        // .time_to_live(Duration::from_secs(3600)) // default TTL if not provided; our custom expiry takes precedence.
         .build();
 
     // Load from disk before accepting requests.
